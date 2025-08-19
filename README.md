@@ -2,6 +2,8 @@
 
 A LangExtract provider plugin that integrates Hugging Face Transformers via `transformers.pipeline`.
 
+> Note: This provider was created for my specific use case. If it doesn’t work for you as-is, please modify it to fit your needs and use it accordingly.
+
 ### Installation
 
 ```bash
