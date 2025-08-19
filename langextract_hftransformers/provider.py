@@ -31,6 +31,11 @@ class HfTransformersLanguageModel(lx.inference.BaseLanguageModel):
       - hf/meta-llama/Llama-3-8b
     """
 
+    @property
+    def requires_fence_output(self) -> bool:
+        """HuggingFace JSON mode returns raw JSON without fences."""
+        return False
+
     def __init__(self, model_id: str, **kwargs):
         """Initialize the HuggingFace provider.
 
@@ -87,7 +92,19 @@ class HfTransformersLanguageModel(lx.inference.BaseLanguageModel):
         for prompt in batch_prompts:
             try:
                 outputs = self.generator(prompt, **gen_kwargs)
-                text = self._extract_text(outputs)
+                text = outputs[0]["generated_text"]
+
+                # Clip to first balanced JSON block to prevent "Extra data" parse errors
+                clipped = self._json_clip(text)
+                # Normalize schema to what LangExtract expects if needed
+                normalized = self._normalize_for_langextract(clipped)
+
+                final_out = normalized if normalized else clipped
+                if not self._looks_like_json(final_out):
+                    # As a production guardrail, return an empty extractions array
+                    final_out = self._fallback_json()
+
+                yield [lx.inference.ScoredOutput(score=1.0, output=final_out)]
             except Exception as e:
                 logger.exception("HF provider generation failed: %s", e)
                 yield [
@@ -95,65 +112,33 @@ class HfTransformersLanguageModel(lx.inference.BaseLanguageModel):
                 ]
                 continue
 
-            logger.debug("HF Provider raw output: %s", text)
-            # Clip to first balanced JSON block to prevent "Extra data" parse errors
-            clipped = self._json_clip(text)
-            # Normalize schema to what LangExtract expects if needed
-            normalized = self._normalize_for_langextract(clipped)
-            if clipped != text:
-                logger.debug("HF Provider clipped JSON: %s", clipped)
-            if normalized and normalized != clipped:
-                logger.debug("HF Provider normalized JSON: %s", normalized)
-
-            final_out = normalized if normalized else clipped
-            if not self._looks_like_json(final_out):
-                # As a production guardrail, return an empty extractions array
-                final_out = self._fallback_json()
-            yield [lx.inference.ScoredOutput(score=1.0, output=final_out)]
-
-    def _extract_text(self, outputs: Any) -> str:
-        """Extract generated text from transformers pipeline outputs robustly."""
-        try:
-            if isinstance(outputs, list) and outputs:
-                first = outputs[0]
-                if isinstance(first, dict):
-                    return (
-                        first.get("generated_text")
-                        or first.get("summary_text")
-                        or first.get("translation_text")
-                        or first.get("text")
-                        or str(first)
-                    )
-                return str(first)
-            if isinstance(outputs, dict):
-                return (
-                    outputs.get("generated_text")
-                    or outputs.get("summary_text")
-                    or outputs.get("translation_text")
-                    or outputs.get("text")
-                    or str(outputs)
-                )
-            return str(outputs)
-        except Exception:
-            return str(outputs)
-
     def _json_clip(self, text: str) -> str:
         """Return only the first balanced JSON object/array substring if present.
 
         Helps LangExtract json.loads avoid "Extra data" when models add prose
-        before/after the JSON.
+        before/after the JSON. Ensures we return a dict, not an array.
         """
         if not text:
             return text
         s = self._strip_code_fences(str(text).strip())
-        # Find first JSON opening
+
+        # Find first JSON opening (prefer object over array)
         start = None
         for i, ch in enumerate(s):
-            if ch in "[{":
+            if ch == "{":  # Prefer objects
                 start = i
                 break
+
+        # If no object found, look for array
+        if start is None:
+            for i, ch in enumerate(s):
+                if ch == "[":
+                    start = i
+                    break
+
         if start is None:
             return s
+
         stack = []
         for j in range(start, len(s)):
             ch = s[j]
@@ -166,7 +151,19 @@ class HfTransformersLanguageModel(lx.inference.BaseLanguageModel):
                 if (top == "[" and ch == "]") or (top == "{" and ch == "}"):
                     stack.pop()
                     if not stack:
-                        return s[start : j + 1]
+                        json_content = s[start : j + 1]
+                        # If we got an array, wrap it in extractions object
+                        if json_content.startswith("["):
+                            try:
+                                import json
+
+                                array_data = json.loads(json_content)
+                                return json.dumps(
+                                    {"extractions": array_data}, ensure_ascii=False
+                                )
+                            except:
+                                return json_content
+                        return json_content
         return s
 
     @staticmethod
@@ -185,44 +182,90 @@ class HfTransformersLanguageModel(lx.inference.BaseLanguageModel):
         Expected: {"extractions": [{"extraction_class": str,
                                       "extraction_text": str,
                                       "attributes": {...}}]}
-        Model often returns: {"extractions": [{"task": str,
-                                               "task_attributes": {...}}]}
+        Model often returns: {"task": str, "task_attributes": {...}}
         """
         try:
             obj = json.loads(text)
             if not isinstance(obj, dict):
                 return None
+
+            # Check if it's already in the correct format
+            if "extractions" in obj and isinstance(obj["extractions"], list):
+                return None  # Already correct format
+
+            # Handle single task object format: {"task": "...", "task_attributes": {...}}
+            if "task" in obj and "task_attributes" in obj:
+                extraction = {
+                    "extraction_class": "task",
+                    "extraction_text": obj["task"],
+                    "attributes": obj["task_attributes"],
+                }
+                normalized = {"extractions": [extraction]}
+                return json.dumps(normalized, ensure_ascii=False)
+
+            # Handle array of tasks: [{"task": "...", "task_attributes": {...}}, ...]
+            if isinstance(obj, list):
+                normalized_items = []
+                for item in obj:
+                    if isinstance(item, dict):
+                        task_text = (
+                            item.get("task")
+                            or item.get("extraction_text")
+                            or item.get("text")
+                            or ""
+                        )
+                        attributes = (
+                            item.get("task_attributes") or item.get("attributes") or {}
+                        )
+                        normalized_items.append(
+                            {
+                                "extraction_class": "task",
+                                "extraction_text": task_text,
+                                "attributes": attributes,
+                            }
+                        )
+                if normalized_items:
+                    normalized = {"extractions": normalized_items}
+                    return json.dumps(normalized, ensure_ascii=False)
+
+            # Handle old array format in "extractions" key but wrong schema
             items = obj.get("extractions")
-            if not isinstance(items, list) or not items:
-                return None
-            # Check if already in expected schema
-            sample = items[0]
-            if isinstance(sample, dict) and {
-                "extraction_class",
-                "extraction_text",
-                "attributes",
-            }.issubset(sample.keys()):
-                return None
-            # Transform task/task_attributes -> extraction schema
-            normalized_items = []
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                extraction_text = (
-                    it.get("task") or it.get("extraction_text") or it.get("text") or ""
-                )
-                attributes = it.get("task_attributes") or it.get("attributes") or {}
-                normalized_items.append(
-                    {
-                        "extraction_class": "task",
-                        "extraction_text": extraction_text,
-                        "attributes": attributes,
-                    }
-                )
-            normalized = {"extractions": normalized_items}
-            return json.dumps(normalized, ensure_ascii=False)
+            if isinstance(items, list) and items:
+                # Check if already in expected schema
+                sample = items[0]
+                if isinstance(sample, dict) and {
+                    "extraction_class",
+                    "extraction_text",
+                    "attributes",
+                }.issubset(sample.keys()):
+                    return None  # Already correct
+
+                # Transform task/task_attributes -> extraction schema
+                normalized_items = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    extraction_text = (
+                        it.get("task")
+                        or it.get("extraction_text")
+                        or it.get("text")
+                        or ""
+                    )
+                    attributes = it.get("task_attributes") or it.get("attributes") or {}
+                    normalized_items.append(
+                        {
+                            "extraction_class": "task",
+                            "extraction_text": extraction_text,
+                            "attributes": attributes,
+                        }
+                    )
+                normalized = {"extractions": normalized_items}
+                return json.dumps(normalized, ensure_ascii=False)
+
         except Exception:
             return None
+
+        return None
 
     @staticmethod
     def _looks_like_json(s: str) -> bool:
